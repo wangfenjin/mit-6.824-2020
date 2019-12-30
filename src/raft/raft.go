@@ -182,17 +182,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	*/
+	if args.Term == rf.currentTerm && rf.leaderId != -1 {
+		DPrintf(rf.Context(), "args.Term %v already has leader %d, return", args.Term, rf.leaderId)
+		return
+	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.votedFor == -1 {
+		DPrintf(rf.Context(), "term arg: %d, me %d, vote for server %v success", args.Term, rf.currentTerm, args.CandidateId)
+		rf.heartbeatTime = time.Now()
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		DPrintf(rf.Context(), "vote for server %v success", args.CandidateId)
-	} else if args.Term > rf.currentTerm {
-		rf.votedFor = args.CandidateId
-		args.Term = rf.currentTerm
-		DPrintf(rf.Context(), "vote for server %v success", args.CandidateId)
 	} else {
 		DPrintf(rf.Context(), "not vote for server %v, voteFor %v", args.CandidateId, rf.votedFor)
 	}
@@ -264,9 +265,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if !reply.Success {
-		DPrintf(rf.Context(), "send heartbeat to server %d args %v failed", server, args)
+		if len(args.Entries) == 0 {
+			DPrintf(rf.Context(), "heartbeat to server %d args %v failed", server, args)
+		} else {
+			DPrintf(rf.Context(), "append entries to server %d args %v failed", server, args)
+		}
 	} else {
-		DPrintf(rf.Context(), "send heartbeat to server %d args %v success", server, args)
+		// DPrintf(rf.Context(), "send heartbeat to server %d args %v success", server, args)
 	}
 	return ok
 }
@@ -349,36 +354,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-const heartbeatInterval = time.Millisecond * 150
-
-func (rf *Raft) leaderElection() {
-	for {
-		now := time.Now()
-		// rand.Seed(now.UnixNano())
-		electionTimeout := time.Millisecond * time.Duration(rand.Intn(200)+300)
-		time.Sleep(electionTimeout)
-		if rf.leaderId != rf.me && rf.heartbeatTime.Before(now) {
-			rf.voteSelf()
-		}
-	}
-}
-
 func (rf *Raft) promptToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.state = Leader
-	rf.votedFor = rf.me
+	rf.votedFor = -1
 	rf.leaderId = rf.me
 }
 
 func (rf *Raft) backToFollower(term, leaderId int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.heartbeatTime = time.Now()
+	rf.state = Follower
+	rf.votedFor = -1
+	rf.leaderId = leaderId
 	if term > rf.currentTerm {
-		rf.state = Follower
 		rf.currentTerm = term
-		rf.votedFor = -1
-		rf.leaderId = leaderId
 	}
 }
 
@@ -387,7 +379,7 @@ func (rf *Raft) becomeCandidate() {
 	defer rf.mu.Unlock()
 	rf.state = Candidate
 	rf.currentTerm += 1
-	rf.votedFor = -1
+	rf.votedFor = rf.me
 	rf.leaderId = -1
 }
 
@@ -411,7 +403,6 @@ func (rf *Raft) logReplication() {
 					if input.Term < rf.currentTerm {
 						break
 					}
-					rf.heartbeatTime = time.Now()
 					if input.Term > rf.currentTerm {
 						rf.backToFollower(input.Term, input.LeaderId)
 					}
@@ -429,6 +420,8 @@ func (rf *Raft) heartbeatsGo() {
 		go rf.heartbeatOnce(i)
 	}
 }
+
+const heartbeatInterval = time.Millisecond * 150
 
 func (rf *Raft) heartbeatOnce(server int) {
 	for {
@@ -452,12 +445,35 @@ func (rf *Raft) heartbeatOnce(server int) {
 	}
 }
 
-func (rf *Raft) voteSelf() {
-	if rf.state == Leader || rf.votedFor != -1 {
-		return
+func (rf *Raft) leaderElection() {
+	for {
+		now := time.Now()
+		// rand.Seed(now.UnixNano())
+		electionTimeout := time.Millisecond * time.Duration(rand.Intn(200)+300)
+		time.Sleep(electionTimeout)
+		rf.mu.Lock()
+		if rf.leaderId != rf.me && rf.heartbeatTime.Before(now) {
+			rf.state = Candidate
+			rf.currentTerm += 1
+			rf.votedFor = rf.me
+			rf.leaderId = -1
+			majority := len(rf.peers)/2 + 1
+			if count := rf.voteSelf(); count >= majority {
+				DPrintf(rf.Context(), "vote count %d, set to leader", count)
+				rf.state = Leader
+				rf.leaderId = rf.me
+			} else {
+				DPrintf(rf.Context(), "vote count %d, leader election failed, wait next round", count)
+				rf.votedFor = -1
+				rf.state = Follower
+			}
+		}
+		rf.mu.Unlock()
 	}
+}
+
+func (rf *Raft) voteSelf() int {
 	DPrintf(rf.Context(), "start to vote self")
-	rf.becomeCandidate()
 	replies := make([]*RequestVoteReply, len(rf.peers))
 	var wg sync.WaitGroup
 	for i, _ := range rf.peers {
@@ -491,8 +507,7 @@ func (rf *Raft) voteSelf() {
 			continue
 		}
 		if reply.Term > rf.currentTerm {
-			rf.backToFollower(reply.Term, -1)
-			return
+			return 0
 		}
 		if reply.VoteGranted {
 			// DPrintf(rf.Context(), "node %d vote for me", i)
@@ -501,13 +516,5 @@ func (rf *Raft) voteSelf() {
 			// DPrintf(rf.Context(), "node %d not vote for me", i)
 		}
 	}
-	majority := len(rf.peers)/2 + 1
-	if voteCount >= majority {
-		// set to leader
-		// DPrintf(rf.Context(), "heartbeats success count %d", rf.heartbeats())
-		rf.promptToLeader()
-		DPrintf(rf.Context(), "vote count %d, set to leader", voteCount)
-	} else {
-		DPrintf(rf.Context(), "vote count %d, leader election failed, wait next round", voteCount)
-	}
+	return voteCount
 }
