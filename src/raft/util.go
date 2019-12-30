@@ -17,7 +17,7 @@ func init() {
 
 func DPrintf(ctx context.Context, format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
-		log.Printf("node: %d, term %d, leader: %d log: %s", ctx.Value("node"), ctx.Value("term"), ctx.Value("leader"), fmt.Sprintf(format, a...))
+		log.Printf("node: %d, term %d, leader: %d, log: %s", ctx.Value("node"), ctx.Value("term"), ctx.Value("leader"), fmt.Sprintf(format, a...))
 	}
 	return
 }
