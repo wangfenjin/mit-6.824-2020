@@ -95,13 +95,13 @@ type Raft struct {
 	heartbeatTime time.Time
 }
 
-func (rf *Raft) LockContext() context.Context {
+func (rf *Raft) lockContext() context.Context {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
-	return rf.Context()
+	return rf.context()
 }
 
-func (rf *Raft) Context() context.Context {
+func (rf *Raft) context() context.Context {
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, "node", rf.me)
 	ctx = context.WithValue(ctx, "term", rf.currentTerm)
@@ -202,11 +202,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
-		DPrintf(rf.Context(), "args.Term %v < currentTerm %v, return", args.Term, rf.currentTerm)
+		DPrintf(rf.context(), "args.Term %v < currentTerm %v, return", args.Term, rf.currentTerm)
 		return
 	}
 	if args.Term == rf.currentTerm && rf.leaderId != -1 {
-		DPrintf(rf.Context(), "args.Term %v already has leader %d, return", args.Term, rf.leaderId)
+		DPrintf(rf.context(), "args.Term %v already has leader %d, return", args.Term, rf.leaderId)
 		return
 	}
 
@@ -219,11 +219,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	entry := rf.log[len(rf.log)-1]
 	if rf.votedFor == -1 &&
 		(entry.Term < args.LastLogTerm || (entry.Term == args.LastLogTerm && entry.Index <= args.LastLogIndex)) {
-		DPrintf(rf.Context(), "vote for server %v success, current term:index = %d:%d, candidate term:index = %d:%d", args.CandidateId, entry.Term, entry.Index, args.LastLogTerm, args.LastLogIndex)
+		DPrintf(rf.context(), "vote for server %v success, current term:index = %d:%d, candidate term:index = %d:%d", args.CandidateId, entry.Term, entry.Index, args.LastLogTerm, args.LastLogIndex)
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 	} else {
-		DPrintf(rf.Context(), "not vote for server %v, voteFor %v", args.CandidateId, rf.votedFor)
+		DPrintf(rf.context(), "not vote for server %v, voteFor %v", args.CandidateId, rf.votedFor)
 	}
 	rf.persist()
 }
@@ -282,17 +282,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	if rf.leaderId != -1 && rf.leaderId != args.LeaderId {
-		DPrintf(rf.Context(), "args leaderId %d < currentLeaderId %d, return", args.LeaderId, rf.leaderId)
+		DPrintf(rf.context(), "args leaderId %d < currentLeaderId %d, return", args.LeaderId, rf.leaderId)
 		return
 	}
 
 	if args.Term < rf.currentTerm {
-		DPrintf(rf.Context(), "1: args Term %d < currentTerm %d, return", args.Term, rf.currentTerm)
+		DPrintf(rf.context(), "1: args Term %d < currentTerm %d, return", args.Term, rf.currentTerm)
 		return
 	}
 	if len(rf.log) <= args.PrevLogIndex ||
 		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		DPrintf(rf.Context(), "2: log don't meet prev log condition")
+		DPrintf(rf.context(), "2: log don't meet prev log condition")
 		return
 	}
 
@@ -322,7 +322,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	rf.persist()
-	DPrintf(rf.Context(), "receive %d entries from leader %d", len(args.Entries), rf.leaderId)
+	DPrintf(rf.context(), "receive %d entries from leader %d", len(args.Entries), rf.leaderId)
 	return
 }
 
@@ -340,20 +340,20 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		if ok {
 			if !reply.Success {
 				if len(args.Entries) == 0 {
-					DPrintf(rf.LockContext(), "heartbeat to server %d failed", server)
+					DPrintf(rf.lockContext(), "heartbeat to server %d failed", server)
 				} else {
-					DPrintf(rf.LockContext(), "append entries to server %d failed", server)
+					DPrintf(rf.lockContext(), "append entries to server %d failed", server)
 				}
 			} else {
 				if len(args.Entries) == 0 {
-					DPrintf(rf.LockContext(), "send heartbeat to server %d success", server)
+					DPrintf(rf.lockContext(), "send heartbeat to server %d success", server)
 				} else {
-					//DPrintf(rf.LockContext(), "append entries to server %d success", server)
+					//DPrintf(rf.lockContext(), "append entries to server %d success", server)
 				}
 			}
 		}
 	case <-time.After(heartbeatInterval):
-		DPrintf(rf.LockContext(), "contact server %d timeout", server)
+		DPrintf(rf.lockContext(), "contact server %d timeout", server)
 	}
 	return ok
 }
@@ -386,7 +386,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	DPrintf(rf.Context(), "start raft %v", command)
+	DPrintf(rf.context(), "start raft %v", command)
 
 	index = len(rf.log)
 	le := &LogEntry{
@@ -533,7 +533,7 @@ func (rf *Raft) applyLogs() {
 			Command:      entry.Command,
 			CommandIndex: entry.Index,
 		}
-		DPrintf(rf.Context(), "apply index %d, command %v", entry.Index, entry.Command)
+		DPrintf(rf.context(), "apply index %d, command %v", entry.Index, entry.Command)
 	}
 }
 
@@ -599,11 +599,11 @@ func (rf *Raft) leaderElection() {
 			rf.leaderId = -1
 			majority := len(rf.peers)/2 + 1
 			if count, term := rf.voteSelf(); count >= majority {
-				DPrintf(rf.Context(), "vote count %d, set to leader", count)
+				DPrintf(rf.context(), "vote count %d, set to leader", count)
 				rf.state = Leader
 				rf.leaderId = rf.me
 			} else {
-				DPrintf(rf.Context(), "vote count %d, leader election failed, wait next round", count)
+				DPrintf(rf.context(), "vote count %d, leader election failed, wait next round", count)
 				if term > rf.currentTerm {
 					rf.currentTerm = term
 				}
@@ -617,7 +617,7 @@ func (rf *Raft) leaderElection() {
 }
 
 func (rf *Raft) voteSelf() (int, int) {
-	DPrintf(rf.Context(), "start to vote self")
+	DPrintf(rf.context(), "start to vote self")
 	replies := make([]*RequestVoteReply, len(rf.peers))
 	var m sync.Mutex
 	var wg sync.WaitGroup
