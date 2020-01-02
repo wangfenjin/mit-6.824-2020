@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
 	"context"
+	"labgob"
 	"labrpc"
 	"math/rand"
 	"sort"
@@ -72,13 +74,16 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+
+	// persisted state
 	currentTerm int
 	votedFor    int
-	state       raftState
-	leaderId    int
-
 	log         []*LogEntry
-	logLength   int
+
+	// node status
+	state    raftState
+	leaderId int
+
 	commitIndex int //highest log entry known to be committed
 	lastApplied int // highest log entry applied to state machine
 	applyCh     chan ApplyMsg
@@ -87,8 +92,6 @@ type Raft struct {
 	nextIndex  []int // index of the next log entry
 	matchIndex []int // highest log entry known to be relicated
 
-	inputEntry    []chan *AppendEntriesArgs
-	outputEntry   []chan *AppendEntriesArgs
 	heartbeatTime time.Time
 }
 
@@ -129,12 +132,13 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -148,17 +152,21 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logs []*LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logs) != nil {
+		rf.log = make([]*LogEntry, 0, 100)
+		rf.log = append(rf.log, &LogEntry{}) // index start from 1
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = logs
+	}
 }
 
 //
@@ -217,6 +225,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		DPrintf(rf.Context(), "not vote for server %v, voteFor %v", args.CandidateId, rf.votedFor)
 	}
+	rf.persist()
 }
 
 //
@@ -312,6 +321,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyLogs()
 	}
 
+	rf.persist()
 	DPrintf(rf.Context(), "receive %d entries from leader %d", len(args.Entries), rf.leaderId)
 	return
 }
@@ -431,14 +441,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
-	rf.inputEntry = make([]chan *AppendEntriesArgs, len(peers))
-	rf.outputEntry = make([]chan *AppendEntriesArgs, len(peers))
 	for i, _ := range peers {
 		if i == rf.me {
 			continue
 		}
-		rf.inputEntry[i] = make(chan *AppendEntriesArgs, 10)
-		rf.outputEntry[i] = make(chan *AppendEntriesArgs, 10)
 		rf.nextIndex[i] = len(rf.log)
 		rf.matchIndex[i] = 0
 	}
@@ -496,6 +502,7 @@ func (rf *Raft) logReplication() {
 					} else if rf.nextIndex[server] > 2 {
 						rf.nextIndex[server] -= 1
 					}
+					rf.persist()
 					rf.mu.Unlock()
 
 				}
@@ -569,6 +576,7 @@ func (rf *Raft) heartbeatOnce(server int) {
 				rf.votedFor = -1
 				rf.leaderId = -1
 				rf.state = Follower
+				rf.persist()
 			}
 			rf.mu.Unlock()
 
@@ -602,6 +610,7 @@ func (rf *Raft) leaderElection() {
 				rf.votedFor = -1
 				rf.state = Follower
 			}
+			rf.persist()
 		}
 		rf.mu.Unlock()
 	}
