@@ -20,6 +20,7 @@ package raft
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"labgob"
 	"labrpc"
 	"math/rand"
@@ -54,6 +55,7 @@ const (
 	Follower = iota
 	Candidate
 	Leader
+	Killed
 )
 
 type LogEntry struct {
@@ -93,6 +95,7 @@ type Raft struct {
 	matchIndex []int // highest log entry known to be relicated
 
 	heartbeatTime time.Time
+	killedChan    chan bool
 }
 
 func (rf *Raft) lockContext() context.Context {
@@ -346,7 +349,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				}
 			} else {
 				if len(args.Entries) == 0 {
-					DPrintf(rf.lockContext(), "send heartbeat to server %d success", server)
+					//DPrintf(rf.lockContext(), "send heartbeat to server %d success", server)
 				} else {
 					//DPrintf(rf.lockContext(), "append entries to server %d success", server)
 				}
@@ -406,7 +409,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // turn off debug output from this instance.
 //
 func (rf *Raft) Kill() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here, if desired.
+	rf.state = Killed
+	close(rf.killedChan)
+	// close(rf.applyCh)
 }
 
 //
@@ -430,6 +438,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = Follower
+	rf.killedChan = make(chan bool)
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.commitIndex = 0
@@ -469,6 +478,10 @@ func (rf *Raft) logReplication() {
 				time.Sleep(time.Millisecond * 50)
 
 				rf.mu.RLock()
+				if rf.state == Killed {
+					rf.mu.RUnlock()
+					return
+				}
 				if rf.state != Leader || rf.nextIndex[server] >= len(rf.log) {
 					rf.mu.RUnlock()
 					continue
@@ -525,15 +538,25 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 }
 
 func (rf *Raft) applyLogs() {
+	if rf.state == Killed {
+		return
+	}
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied += 1
 		entry := rf.log[rf.lastApplied]
-		rf.applyCh <- ApplyMsg{
+		msg := ApplyMsg{
 			CommandValid: entry.Command != nil,
 			Command:      entry.Command,
 			CommandIndex: entry.Index,
 		}
-		DPrintf(rf.context(), "apply index %d, command %v", entry.Index, entry.Command)
+		select {
+		case rf.applyCh <- msg:
+			DPrintf(rf.context(), "apply index %d success, command %v", entry.Index, entry.Command)
+		case <-rf.killedChan:
+			return
+		case <-time.After(time.Second * 5):
+			panic(fmt.Sprintf("server %d blocked on index %d for 5s", rf.me, entry.Index))
+		}
 	}
 }
 
@@ -556,6 +579,10 @@ func (rf *Raft) heartbeatOnce(server int) {
 		}
 
 		rf.mu.RLock()
+		if rf.state == Killed {
+			rf.mu.RUnlock()
+			return
+		}
 		lastEntry := rf.log[len(rf.log)-1]
 		heartbeatMsg := &AppendEntriesArgs{
 			Term:         rf.currentTerm,
@@ -592,7 +619,16 @@ func (rf *Raft) leaderElection() {
 		time.Sleep(electionTimeout)
 
 		rf.mu.Lock()
-		if rf.leaderId != rf.me && rf.heartbeatTime.Before(now) {
+		if rf.state == Killed {
+			rf.mu.Unlock()
+			return
+		}
+		// NOTE: if the node was partitioned and can't contact any other node,
+		// it may think it's still a leader, make it Candidate
+		// which means we need to at least heartbeat succeed to make self as a leader
+		// more accurate should be heartbeat to quorum
+		//if rf.leaderId != rf.me && rf.heartbeatTime.Before(now) {
+		if rf.heartbeatTime.Before(now) {
 			rf.state = Candidate
 			rf.currentTerm += 1
 			rf.votedFor = rf.me

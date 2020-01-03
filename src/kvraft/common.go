@@ -1,8 +1,14 @@
 package raftkv
 
+import (
+	"sync"
+	"time"
+)
+
 const (
-	OK       = "OK"
-	ErrNoKey = "ErrNoKey"
+	OK         = "OK"
+	ErrNoKey   = "ErrNoKey"
+	ErrTimeout = "ErrTimeout"
 )
 
 type Err string
@@ -15,6 +21,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	UUID string
 }
 
 type PutAppendReply struct {
@@ -25,10 +32,27 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	UUID string
 }
 
 type GetReply struct {
 	WrongLeader bool
 	Err         Err
 	Value       string
+}
+
+// waitTimeout waits for the waitgroup for the specified max timeout.
+// Returns true if waiting timed out.
+func waitTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
+	c := make(chan struct{})
+	go func() {
+		defer close(c)
+		wg.Wait()
+	}()
+	select {
+	case <-c:
+		return false // completed normally
+	case <-time.After(timeout):
+		return true // timed out
+	}
 }
