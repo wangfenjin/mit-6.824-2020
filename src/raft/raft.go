@@ -627,8 +627,8 @@ func (rf *Raft) leaderElection() {
 		// it may think it's still a leader, make it Candidate
 		// which means we need to at least heartbeat succeed to make self as a leader
 		// more accurate should be heartbeat to quorum
-		//if rf.leaderId != rf.me && rf.heartbeatTime.Before(now) {
-		if rf.heartbeatTime.Before(now) {
+		//if rf.heartbeatTime.Before(now) {
+		if rf.leaderId != rf.me && rf.heartbeatTime.Before(now) {
 			rf.state = Candidate
 			rf.currentTerm += 1
 			rf.votedFor = rf.me
