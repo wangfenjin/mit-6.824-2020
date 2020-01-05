@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -64,6 +65,10 @@ type KVServer struct {
 	resultCh map[int]chan string
 
 	serverKilled chan bool
+
+	// snapshot
+	persister     *raft.Persister
+	snapshotIndex int
 }
 
 var TimeoutErr = errors.New("kv: timeout error")
@@ -187,7 +192,6 @@ func (kv *KVServer) Kill() {
 	defer kv.mu.Unlock()
 
 	kv.rf.Kill()
-	kv.serverKilled <- true
 	close(kv.serverKilled)
 	for _, ch := range kv.resultCh {
 		close(ch)
@@ -216,6 +220,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.state = make(map[string]string)
@@ -226,10 +231,60 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.resultCh = make(map[int]chan string)
 	kv.serverKilled = make(chan bool)
 
+	kv.readPersist()
+
 	// You may need initialization code here.
 	go kv.readApplyCh()
+	go kv.checkSnapshot()
 
 	return kv
+}
+
+func (kv *KVServer) checkSnapshot() {
+	for {
+		select {
+		case <-time.After(time.Second):
+			kv.saveSnapshot()
+		case <-kv.serverKilled:
+			return
+		}
+	}
+}
+
+func (kv *KVServer) saveSnapshot() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if kv.rf.SaveSnapshot(kv.getPersistData(), kv.index, kv.maxraftstate) {
+		kv.snapshotIndex = kv.index
+		DPrintf(kv.context(), "save snapshot succeed, index %d", kv.snapshotIndex)
+	}
+}
+
+func (kv *KVServer) getPersistData() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.state)
+	e.Encode(kv.index)
+	return w.Bytes()
+}
+
+func (kv *KVServer) readPersist() {
+	data := kv.persister.ReadSnapshot()
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var state map[string]string
+	var snapshotIndex int
+	if d.Decode(&state) != nil ||
+		d.Decode(&snapshotIndex) != nil {
+		// do nothing
+	} else {
+		kv.state = state
+		kv.snapshotIndex = snapshotIndex
+	}
 }
 
 func (kv *KVServer) readApplyCh() {
@@ -237,12 +292,21 @@ func (kv *KVServer) readApplyCh() {
 		select {
 		case msg := <-kv.applyCh:
 			if !msg.CommandValid {
+				switch v := msg.Command.(type) {
+				case raft.SnapShotCommand:
+					kv.mu.Lock()
+					if v.Index > kv.index {
+						kv.readPersist()
+					}
+					kv.mu.Unlock()
+					break
+				default:
+					panic(fmt.Sprintf("unknow command %v", v))
+				}
 				break
 			}
-			op, ok := msg.Command.(Op)
-			if !ok {
-				break
-			}
+
+			op, _ := msg.Command.(Op)
 			kv.mu.Lock()
 			if kv.acks[op.UUID] {
 				kv.mu.Unlock()
@@ -251,6 +315,11 @@ func (kv *KVServer) readApplyCh() {
 			// DPrintf(kv.context(), "get apply msg %v", msg)
 			kv.acks[op.UUID] = true
 			kv.index = msg.CommandIndex
+			// filter old message
+			if kv.index <= kv.snapshotIndex {
+				kv.mu.Unlock()
+				break
+			}
 			switch op.Command {
 			case OpCommandAppend:
 				kv.state[op.Key] += op.Value
