@@ -116,7 +116,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
-	DPrintf(kv.context(), "get %s success", args.UUID)
 	if v, ok := kv.state[args.Key]; ok {
 		reply.Err = OK
 		reply.Value = v
@@ -157,7 +156,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrTimeout
 		return
 	}
-	DPrintf(kv.context(), "%s %s success", args.Op, args.UUID)
 	reply.Err = OK
 	return
 }
@@ -238,25 +236,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	go kv.readApplyCh()
-	go kv.checkSnapshot()
 
 	DPrintf(kv.context(), "start kvserver")
 	return kv
 }
 
-func (kv *KVServer) checkSnapshot() {
-	for {
-		select {
-		case <-time.After(time.Millisecond * 100):
-			kv.saveSnapshot()
-		case <-kv.serverKilled:
-			return
-		}
-	}
-}
-
-func (kv *KVServer) saveSnapshot() {
-	if kv.rf.ShouldSnapshot(kv.index, kv.maxraftstate) {
+func (kv *KVServer) trySnapshot() {
+	if kv.index%20 == 0 && kv.rf.ShouldSnapshot(kv.index, kv.maxraftstate) {
 		kv.mu.Lock()
 		snapshot := kv.getPersistData()
 		kv.mu.Unlock()
@@ -369,5 +355,6 @@ func (kv *KVServer) readApplyCh() {
 			DPrintf(kv.context(), "server killed")
 			return
 		}
+		kv.trySnapshot()
 	}
 }

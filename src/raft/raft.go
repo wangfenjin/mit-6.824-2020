@@ -102,6 +102,7 @@ type Raft struct {
 
 	heartbeatTime time.Time
 	killedChan    chan bool
+	newEntry      chan bool
 
 	// snapshot
 	snapshotIndex int
@@ -160,7 +161,7 @@ func (rf *Raft) getPersistData() []byte {
 func (rf *Raft) ShouldSnapshot(index, maxsize int) bool {
 	return maxsize > 0 &&
 		rf.commitIndex >= index &&
-		len(rf.getPersistData()) >= maxsize
+		rf.persister.RaftStateSize() >= maxsize
 }
 
 func (rf *Raft) SaveSnapshot(snapshot []byte, index int) bool {
@@ -550,6 +551,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.mu.Lock()
+	defer func() {
+		rf.newEntry <- true
+	}()
 	defer rf.mu.Unlock()
 
 	prevEntry := rf.log[len(rf.log)-1]
@@ -563,7 +567,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   index,
 	}
 	rf.log = append(rf.log, le)
-
 	return index, term, isLeader
 }
 
@@ -609,6 +612,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.commitIndex = 0
 	rf.leaderId = -1
+	rf.newEntry = make(chan bool)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -642,7 +646,10 @@ func (rf *Raft) logReplication() {
 				return
 			}
 			for {
-				time.Sleep(time.Millisecond * 50)
+				select {
+				case <-rf.newEntry:
+				case <-time.After(time.Millisecond * 100):
+				}
 
 				rf.mu.RLock()
 				if rf.state == Killed {
@@ -758,7 +765,6 @@ func (rf *Raft) applyLogs() bool {
 		if rf.lastApplied != entry.Index {
 			panic("lastApplied should == entry.Index")
 		}
-		DPrintf(rf.context(), "start to apply index %d, logindex %d, len(log) %d, lastApplied %d, snapshotIndex %d", entry.Index, applyIndex, len(rf.log), rf.lastApplied, rf.snapshotIndex)
 		select {
 		case rf.applyCh <- msg:
 			DPrintf(rf.context(), "apply index %d success", entry.Index)

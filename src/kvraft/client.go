@@ -11,6 +11,8 @@ type Clerk struct {
 	// You will have to modify this struct.
 	n      int // server number
 	leader int
+
+	id int64
 }
 
 func nrand() int64 {
@@ -26,6 +28,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	ck.n = len(servers)
 	ck.leader = 0
+	ck.id = nrand()
 	return ck
 }
 
@@ -47,16 +50,19 @@ func (ck *Clerk) Get(key string) string {
 		Key:  key,
 		UUID: randstring(32),
 	}
-	var reply GetReply
 	index := ck.leader
-	for reply.Err != OK && reply.Err != ErrNoKey {
+	for {
+		var reply GetReply
 		ok := ck.servers[index].Call("KVServer.Get", &args, &reply)
 		if !ok || reply.WrongLeader {
 			index = (index + 1) % ck.n
+			continue
+		}
+		if reply.Err == OK || reply.Err == ErrNoKey {
+			ck.leader = index
+			return reply.Value
 		}
 	}
-	ck.leader = index
-	return reply.Value
 }
 
 //
@@ -77,15 +83,19 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Value: value,
 		UUID:  randstring(32),
 	}
-	var reply PutAppendReply
 	index := ck.leader
-	for reply.Err != OK {
+	for {
+		var reply PutAppendReply
 		ok := ck.servers[index].Call("KVServer.PutAppend", &args, &reply)
 		if !ok || reply.WrongLeader {
 			index = (index + 1) % ck.n
+			continue
+		}
+		if reply.Err == OK {
+			ck.leader = index
+			return
 		}
 	}
-	ck.leader = index
 }
 
 func (ck *Clerk) Put(key string, value string) {
