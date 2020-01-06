@@ -157,21 +157,16 @@ func (rf *Raft) getPersistData() []byte {
 	return w.Bytes()
 }
 
-func (rf *Raft) SaveSnapshot(snapshot []byte, index, maxsize int) bool {
-	if maxsize <= 0 {
-		return false
-	}
+func (rf *Raft) ShouldSnapshot(index, maxsize int) bool {
+	return maxsize > 0 &&
+		rf.commitIndex >= index &&
+		len(rf.getPersistData()) >= maxsize
+}
 
+func (rf *Raft) SaveSnapshot(snapshot []byte, index int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.commitIndex < index {
-		return false
-	}
-	state := rf.getPersistData()
-	if len(state) < maxsize*8/10 {
-		return false
-	}
 	return rf.installSnapshot(snapshot, index)
 }
 

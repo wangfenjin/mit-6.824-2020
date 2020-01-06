@@ -247,7 +247,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 func (kv *KVServer) checkSnapshot() {
 	for {
 		select {
-		case <-time.After(time.Millisecond * 200):
+		case <-time.After(time.Millisecond * 100):
 			kv.saveSnapshot()
 		case <-kv.serverKilled:
 			return
@@ -256,15 +256,16 @@ func (kv *KVServer) checkSnapshot() {
 }
 
 func (kv *KVServer) saveSnapshot() {
-	kv.mu.Lock()
-	snapshot := kv.getPersistData()
-	kv.mu.Unlock()
-
-	if kv.rf.SaveSnapshot(snapshot, kv.index, kv.maxraftstate) {
+	if kv.rf.ShouldSnapshot(kv.index, kv.maxraftstate) {
 		kv.mu.Lock()
-		kv.snapshotIndex = kv.index
+		snapshot := kv.getPersistData()
 		kv.mu.Unlock()
-		DPrintf(kv.context(), "save snapshot succeed, index %d", kv.snapshotIndex)
+		if kv.rf.SaveSnapshot(snapshot, kv.index) {
+			kv.mu.Lock()
+			kv.snapshotIndex = kv.index
+			kv.mu.Unlock()
+			DPrintf(kv.context(), "save snapshot succeed, index %d", kv.snapshotIndex)
+		}
 	}
 }
 
