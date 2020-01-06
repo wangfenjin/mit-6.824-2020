@@ -14,6 +14,8 @@ import (
 	"time"
 )
 
+// NOTE: don't call rf.Func inside lock!!
+
 var Debug = "1"
 
 func init() {
@@ -189,13 +191,14 @@ func (kv *KVServer) waitResultTimeout(index int, uuid string) bool {
 func (kv *KVServer) Kill() {
 	// Your code here, if desired.
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	kv.rf.Kill()
 	close(kv.serverKilled)
 	for _, ch := range kv.resultCh {
 		close(ch)
 	}
+	kv.mu.Unlock()
+
+	kv.rf.Kill()
+	DPrintf(kv.context(), "kill server")
 }
 
 //
@@ -237,13 +240,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go kv.readApplyCh()
 	go kv.checkSnapshot()
 
+	DPrintf(kv.context(), "start kvserver")
 	return kv
 }
 
 func (kv *KVServer) checkSnapshot() {
 	for {
 		select {
-		case <-time.After(time.Second):
+		case <-time.After(time.Millisecond * 200):
 			kv.saveSnapshot()
 		case <-kv.serverKilled:
 			return
@@ -253,10 +257,13 @@ func (kv *KVServer) checkSnapshot() {
 
 func (kv *KVServer) saveSnapshot() {
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
+	snapshot := kv.getPersistData()
+	kv.mu.Unlock()
 
-	if kv.rf.SaveSnapshot(kv.getPersistData(), kv.index, kv.maxraftstate) {
+	if kv.rf.SaveSnapshot(snapshot, kv.index, kv.maxraftstate) {
+		kv.mu.Lock()
 		kv.snapshotIndex = kv.index
+		kv.mu.Unlock()
 		DPrintf(kv.context(), "save snapshot succeed, index %d", kv.snapshotIndex)
 	}
 }
@@ -284,6 +291,10 @@ func (kv *KVServer) readPersist() {
 	} else {
 		kv.state = state
 		kv.snapshotIndex = snapshotIndex
+		if kv.index < snapshotIndex {
+			kv.index = snapshotIndex
+		}
+		DPrintf(kv.context(), "read persist succeed, snapshot index %d", kv.snapshotIndex)
 	}
 }
 
@@ -306,15 +317,26 @@ func (kv *KVServer) readApplyCh() {
 				break
 			}
 
-			op, _ := msg.Command.(Op)
 			kv.mu.Lock()
+			if msg.CommandIndex <= kv.index {
+				// ignore old messages
+				kv.mu.Unlock()
+				break
+			}
+			if msg.CommandIndex != kv.index+1 {
+				errMsg := fmt.Sprintf("server %d index %d get command index %d", kv.me, kv.index, msg.CommandIndex)
+				DPrintf(kv.context(), errMsg)
+				panic(errMsg)
+			}
+			kv.index = msg.CommandIndex
+
+			op, _ := msg.Command.(Op)
 			if kv.acks[op.UUID] {
 				kv.mu.Unlock()
 				break
 			}
 			// DPrintf(kv.context(), "get apply msg %v", msg)
 			kv.acks[op.UUID] = true
-			kv.index = msg.CommandIndex
 			// filter old message
 			if kv.index <= kv.snapshotIndex {
 				kv.mu.Unlock()
@@ -330,6 +352,8 @@ func (kv *KVServer) readApplyCh() {
 			}
 			if _, ok := kv.resultCh[kv.index]; ok {
 				select {
+				case <-kv.serverKilled:
+					return
 				case kv.resultCh[kv.index] <- op.UUID:
 					// do nothing
 				case <-time.After(time.Millisecond * 100):

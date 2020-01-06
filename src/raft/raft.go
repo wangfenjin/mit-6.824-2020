@@ -168,17 +168,17 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index, maxsize int) bool {
 	if rf.commitIndex < index {
 		return false
 	}
-	if index <= rf.snapshotIndex {
-		return false
-	}
 	state := rf.getPersistData()
-	if maxsize > 0 && len(state) < maxsize*8/10 {
+	if len(state) < maxsize*8/10 {
 		return false
 	}
 	return rf.installSnapshot(snapshot, index)
 }
 
 func (rf *Raft) installSnapshot(snapshot []byte, index int) bool {
+	if index <= rf.snapshotIndex {
+		return false
+	}
 	DPrintf(rf.context(), "start to snapshot, index %d, snapshotIndex %d, lastApplied %d, len(log) %d", index, rf.snapshotIndex, rf.lastApplied, len(rf.log))
 	originIndex := rf.snapshotIndex
 	logTruncate := index - originIndex
@@ -359,6 +359,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	index := args.PrevLogIndex - rf.snapshotIndex
+	if index < 0 {
+		if len(args.Entries)+index > 0 {
+			args.Entries = args.Entries[-index:]
+			index = 0
+		} else {
+			reply.Success = true
+			return
+		}
+	}
 	if index >= 0 && (len(rf.log) <= index ||
 		rf.log[index].Term != args.PrevLogTerm) {
 		DPrintf(rf.context(), "2: log don't meet prev log condition, prevLogIndex %d, snapshotIndex %d, len(log) %d", args.PrevLogIndex, rf.snapshotIndex, len(rf.log))
@@ -375,7 +384,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) == 0 {
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
-			rf.applyLogs()
+			if !rf.applyLogs() {
+				reply.Success = false
+				return
+			}
 		}
 		return
 	}
@@ -399,10 +411,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf(rf.context(), "truncate log len %d to %d, from leader %d, prevLogIndex %d, snapshotIndex %d, lastApplied %d", len(rf.log), index+1+j, args.LeaderId, args.PrevLogIndex, rf.snapshotIndex, rf.lastApplied)
 		rf.log = rf.log[:index+1+j]
 	}
+	if rf.log[index+j].Index+1 != args.Entries[j].Index {
+		panic(fmt.Sprintf("%v, %v", rf.log, args.Entries[j:]))
+	}
 	rf.log = append(rf.log, args.Entries[j:]...)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
-		rf.applyLogs()
+		if !rf.applyLogs() {
+			reply.Success = false
+			return
+		}
 	}
 
 	rf.persist()
@@ -539,7 +557,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	prevEntry := rf.log[len(rf.log)-1]
 	index = len(rf.log) + rf.snapshotIndex
+	if prevEntry.Index+1 != index {
+		panic("index not +1")
+	}
 	le := &LogEntry{
 		Command: command,
 		Term:    rf.currentTerm,
@@ -562,6 +584,7 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	rf.state = Killed
 	close(rf.killedChan)
+	DPrintf(rf.context(), "kill raft node")
 	// close(rf.applyCh)
 }
 
@@ -590,11 +613,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.commitIndex = 0
-	rf.lastApplied = 0
 	rf.leaderId = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.lastApplied = rf.snapshotIndex
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
@@ -610,6 +633,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.heartbeatsGo()
 	go rf.logReplication()
 
+	DPrintf(rf.context(), "make raft node")
 	return rf
 }
 
@@ -656,8 +680,12 @@ func (rf *Raft) logReplication() {
 						rf.leaderId = -1
 						rf.state = Follower
 					} else if reply.Success {
-						rf.nextIndex[server] = end
-						rf.matchIndex[server] = end - 1
+						// log might be snapshoted, so end is invalid now...
+						// TODO: may have bad case
+						if end <= len(rf.log) {
+							rf.nextIndex[server] = end
+							rf.matchIndex[server] = end - 1
+						}
 						rf.leaderUpdateCommitIndex()
 						rf.applyLogs()
 					} else if rf.nextIndex[server] > 2 {
@@ -714,32 +742,44 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 	}
 }
 
-func (rf *Raft) applyLogs() {
+func (rf *Raft) applyLogs() bool {
 	if rf.state == Killed {
-		return
+		return false
 	}
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied += 1
-		if rf.lastApplied-rf.snapshotIndex >= len(rf.log) {
-			errMsg := fmt.Sprintf("lastApplied %d, snapshotIndex %d, len(log) %d", rf.lastApplied, rf.snapshotIndex, len(rf.log))
+		applyIndex := rf.lastApplied - rf.snapshotIndex
+		if applyIndex >= len(rf.log) || applyIndex <= 0 {
+			errMsg := fmt.Sprintf("lastApplied %d, snapshotIndex %d, len(log) %d, commitIndex %d", rf.lastApplied, rf.snapshotIndex, len(rf.log), rf.commitIndex)
 			DPrintf(rf.context(), errMsg)
 			panic(errMsg)
 		}
-		entry := rf.log[rf.lastApplied-rf.snapshotIndex]
+		entry := rf.log[applyIndex]
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      entry.Command,
 			CommandIndex: entry.Index,
 		}
+		if rf.lastApplied != entry.Index {
+			panic("lastApplied should == entry.Index")
+		}
+		DPrintf(rf.context(), "start to apply index %d, logindex %d, len(log) %d, lastApplied %d, snapshotIndex %d", entry.Index, applyIndex, len(rf.log), rf.lastApplied, rf.snapshotIndex)
 		select {
 		case rf.applyCh <- msg:
 			DPrintf(rf.context(), "apply index %d success", entry.Index)
 		case <-rf.killedChan:
-			return
-		case <-time.After(time.Second * 5):
-			panic(fmt.Sprintf("server %d blocked on index %d for 5s", rf.me, entry.Index))
+			rf.lastApplied -= 1
+			return false
+		case <-time.After(time.Second):
+			rf.lastApplied -= 1
+			errMsg := fmt.Sprintf("server %d blocked on index %d for 1s, will retry later", rf.me, entry.Index)
+			DPrintf(rf.context(), errMsg)
+			//pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
+			//panic(errMsg)
+			return false
 		}
 	}
+	return true
 }
 
 func (rf *Raft) heartbeatsGo() {
