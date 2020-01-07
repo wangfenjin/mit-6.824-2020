@@ -48,7 +48,7 @@ type Op struct {
 	Command OpCommand
 	Key     string
 	Value   string
-	UUID    string
+	UUID    int64
 }
 
 type KVServer struct {
@@ -61,10 +61,10 @@ type KVServer struct {
 
 	// Your definitions here.
 	state map[string]string
-	acks  map[string]bool
+	acks  map[int64]bool
 	index int
 
-	resultCh map[int]chan string
+	resultCh map[int]chan result
 
 	serverKilled chan bool
 
@@ -73,6 +73,11 @@ type KVServer struct {
 	snapshotCh    chan bool
 	snapshoting   bool
 	snapshotIndex int
+}
+
+type result struct {
+	UUID  int64
+	Value string
 }
 
 var TimeoutErr = errors.New("kv: timeout error")
@@ -111,20 +116,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	if kv.waitResultTimeout(index, args.UUID) {
+	if timeout, value := kv.waitResultTimeout(index, args.UUID); timeout {
 		DPrintf(kv.context(), "get wait index %d timeout, return", index)
 		reply.Err = ErrTimeout
 		return
-	}
-
-	kv.mu.RLock()
-	defer kv.mu.RUnlock()
-	if v, ok := kv.state[args.Key]; ok {
-		reply.Err = OK
-		reply.Value = v
-		return
 	} else {
-		reply.Err = ErrNoKey
+		reply.Err = OK
+		reply.Value = value
 		return
 	}
 }
@@ -155,7 +153,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	if kv.waitResultTimeout(index, args.UUID) {
+	if timeout, _ := kv.waitResultTimeout(index, args.UUID); timeout {
 		DPrintf(kv.context(), "%s wait index %d timeout, return", args.Op, index)
 		reply.Err = ErrTimeout
 		return
@@ -164,9 +162,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	return
 }
 
-func (kv *KVServer) waitResultTimeout(index int, uuid string) bool {
+func (kv *KVServer) waitResultTimeout(index int, uuid int64) (bool, string) {
 	kv.mu.Lock()
-	ch := make(chan string)
+	ch := make(chan result)
 	// the chan for this index might be overwrite by other requests, so this chan may never receive any message
 	// we close this chan for `id := <=ch` to proceed
 	if ch, ok := kv.resultCh[index]; ok {
@@ -178,11 +176,11 @@ func (kv *KVServer) waitResultTimeout(index int, uuid string) bool {
 
 	select {
 	case <-kv.serverKilled:
-		return false
-	case id := <-ch:
-		return id != uuid
+		return true, ""
+	case r := <-ch:
+		return r.UUID != uuid, r.Value
 	case <-time.After(time.Second): // timeout value can't be too small, otherwise log will piled up
-		return true
+		return true, ""
 	}
 }
 
@@ -231,11 +229,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.state = make(map[string]string)
-	kv.acks = make(map[string]bool)
+	kv.acks = make(map[int64]bool)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	kv.resultCh = make(map[int]chan string)
+	kv.resultCh = make(map[int]chan result)
 	kv.serverKilled = make(chan bool)
 	kv.snapshotCh = make(chan bool)
 
@@ -350,7 +348,10 @@ func (kv *KVServer) readApplyCh() {
 				select {
 				case <-kv.serverKilled:
 					return
-				case ch <- op.UUID:
+				case ch <- result{
+					UUID:  op.UUID,
+					Value: kv.state[op.Key],
+				}:
 					DPrintf(kv.context(), "notify result ch index %v success", kv.index)
 				case <-time.After(time.Millisecond * 30):
 					DPrintf(kv.context(), "abandon result ch index %d", kv.index)

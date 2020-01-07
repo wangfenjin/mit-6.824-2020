@@ -48,7 +48,7 @@ func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := GetArgs{
 		Key:  key,
-		UUID: randstring(32),
+		UUID: nrand(),
 	}
 	index := ck.leader
 	for {
@@ -81,7 +81,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Op:    op,
 		Key:   key,
 		Value: value,
-		UUID:  randstring(32),
+		UUID:  nrand(),
 	}
 	index := ck.leader
 	for {
