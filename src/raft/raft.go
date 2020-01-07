@@ -192,9 +192,10 @@ func (rf *Raft) saveSnapshot(snapshot []byte, index int) bool {
 	case <-rf.killedChan:
 		return ok
 	case rf.applyCh <- msg:
-	case <-time.After(time.Second * 5):
-		pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
-		panic(fmt.Sprintf("server %d blocked on install snapshot index %d for 5s", rf.me, index))
+	case <-time.After(time.Millisecond * 50):
+		DPrintf(rf.context(), "save snapshot not notify, ignore")
+		//pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
+		//panic(fmt.Sprintf("server %d blocked on install snapshot index %d for 5s", rf.me, index))
 	}
 	return ok
 
@@ -376,10 +377,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
+	/**
 	if rf.leaderId != -1 && rf.leaderId != args.LeaderId {
 		DPrintf(rf.context(), "args leaderId %d < currentLeaderId %d, return", args.LeaderId, rf.leaderId)
 		return
 	}
+	*/
 
 	if args.Term < rf.currentTerm {
 		DPrintf(rf.context(), "1: args Term %d < currentTerm %d, return", args.Term, rf.currentTerm)
@@ -388,7 +391,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	index := args.PrevLogIndex - rf.snapshotIndex
 	//DPrintf(rf.context(), "prevLogIndex %d, snapshotIndex %d, len(log) %d, args.Entry %d", args.PrevLogIndex, rf.snapshotIndex, len(rf.log), len(args.Entries))
 	if index < 0 || index >= len(rf.log) {
-		DPrintf(rf.context(), "2: log don't meet prev log condition, index %d not in log len(log) %d", index, len(rf.log))
+		DPrintf(rf.context(), "2: log don't meet prev log condition, index %d not in log len(log) %d, from leader %d", index, len(rf.log), args.LeaderId)
 		return
 	}
 	if rf.log[index].Term != args.PrevLogTerm {
@@ -598,7 +601,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   index,
 	}
 	rf.log = append(rf.log, le)
-	DPrintf(rf.context(), "Install snapshot success, start!!! index %d, snapshotIndex %d, lastApplied %d, len(log) %d", index, rf.snapshotIndex, rf.lastApplied, len(rf.log))
+	DPrintf(rf.context(), "Start raft, index %d, snapshotIndex %d, lastApplied %d, len(log) %d", index, rf.snapshotIndex, rf.lastApplied, len(rf.log))
 	return index, term, isLeader
 }
 
@@ -741,7 +744,7 @@ func (rf *Raft) logReplication() {
 						rf.leaderId = -1
 						rf.state = Follower
 					} else if reply.Success {
-						DPrintf(rf.context(), "append entry success, %d", server)
+						// DPrintf(rf.context(), "append entry success, %d", server)
 						// log might be snapshoted, so end is invalid now...
 						// TODO: may have bad case
 						rf.nextIndex[server] = max(nextIndex, rf.snapshotIndex+1)
@@ -869,10 +872,11 @@ func (rf *Raft) heartbeatsNow() {
 const heartbeatInterval = time.Millisecond * 150
 
 func (rf *Raft) leaderElection() {
+	electionBackoff := 300 // incase failed node always first propose election
 	for {
 		now := time.Now()
 		// rand.Seed(now.UnixNano())
-		electionTimeout := time.Millisecond * time.Duration(rand.Intn(200)+300)
+		electionTimeout := time.Millisecond * time.Duration(rand.Intn(200)+electionBackoff)
 		time.Sleep(electionTimeout)
 
 		rf.mu.Lock()
@@ -880,7 +884,9 @@ func (rf *Raft) leaderElection() {
 			rf.mu.Unlock()
 			return
 		}
+
 		if rf.leaderId == rf.me || rf.heartbeatTime.After(now) {
+			electionBackoff = 300
 			rf.mu.Unlock()
 			continue
 		}
@@ -899,6 +905,7 @@ func (rf *Raft) leaderElection() {
 			rf.state = Leader
 			rf.leaderId = rf.me
 			rf.heartbeatsNow()
+			electionBackoff = 300
 		} else {
 			DPrintf(rf.context(), "vote count %d, leader election failed, wait next round", count)
 			if term > rf.currentTerm {
@@ -906,6 +913,7 @@ func (rf *Raft) leaderElection() {
 			}
 			rf.votedFor = -1
 			rf.state = Follower
+			electionBackoff *= 2
 		}
 		rf.persist()
 		rf.mu.Unlock()
