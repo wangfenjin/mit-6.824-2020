@@ -69,9 +69,10 @@ type KVServer struct {
 	serverKilled chan bool
 
 	// snapshot
-	persister   *raft.Persister
-	snapshotCh  chan bool
-	snapshoting bool
+	persister     *raft.Persister
+	snapshotCh    chan bool
+	snapshoting   bool
+	snapshotIndex int
 }
 
 var TimeoutErr = errors.New("kv: timeout error")
@@ -245,10 +246,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	return kv
 }
 
+func (kv *KVServer) shouldSnapshot() bool {
+	return kv.maxraftstate > 0 && kv.index > kv.snapshotIndex && kv.persister.RaftStateSize() > kv.maxraftstate
+}
+
 func (kv *KVServer) snapshot(force bool) {
 	if force || !kv.snapshoting {
-		if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
+		if kv.shouldSnapshot() {
 			kv.snapshoting = true
+			kv.snapshotIndex = kv.index
 			go kv.rf.SaveSnapshot(kv.getPersistData(), kv.index)
 		}
 	}

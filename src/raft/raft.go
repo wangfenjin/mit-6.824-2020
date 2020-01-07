@@ -177,6 +177,7 @@ func (rf *Raft) saveSnapshot(snapshot []byte, index int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.commitIndex < index {
+		DPrintf(rf.context(), "index %d not committed %d, return", index, rf.commitIndex)
 		return false
 	}
 
@@ -203,7 +204,8 @@ func (rf *Raft) saveSnapshot(snapshot []byte, index int) bool {
 
 func (rf *Raft) installSnapshot(snapshot []byte, index int) bool {
 	if index <= rf.snapshotIndex {
-		return false
+		DPrintf(rf.context(), "index %d already snapshot", index)
+		return true
 	}
 	DPrintf(rf.context(), "start to snapshot, index %d, snapshotIndex %d, lastApplied %d, len(log) %d", index, rf.snapshotIndex, rf.lastApplied, len(rf.log))
 	originIndex := rf.snapshotIndex
@@ -215,6 +217,9 @@ func (rf *Raft) installSnapshot(snapshot []byte, index int) bool {
 	rf.snapshotIndex = index
 	if rf.lastApplied < rf.snapshotIndex {
 		rf.lastApplied = rf.snapshotIndex
+	}
+	if rf.commitIndex < rf.snapshotIndex {
+		rf.commitIndex = rf.snapshotIndex
 	}
 	rf.log = rf.log[logTruncate:]
 	for i, _ := range rf.peers {
@@ -259,6 +264,9 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.log = logs
 		rf.snapshotIndex = snapshotIndex
+		if rf.commitIndex < rf.snapshotIndex {
+			rf.commitIndex = rf.snapshotIndex
+		}
 		DPrintf(rf.context(), "lastApplied %d, snapshotIndex %d, len(log) %d", rf.lastApplied, rf.snapshotIndex, len(rf.log))
 	}
 }
@@ -512,6 +520,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
 	}
 	if !rf.installSnapshot(args.Data, args.LastIncludedIndex) {
 		return
@@ -900,7 +911,11 @@ func (rf *Raft) leaderElection() {
 		count, term := rf.voteSelf()
 
 		rf.mu.Lock()
-		if count >= majority {
+		if term > rf.currentTerm {
+			rf.currentTerm = term
+			rf.votedFor = -1
+			rf.state = Follower
+		} else if count >= majority {
 			DPrintf(rf.context(), "vote count %d, set to leader", count)
 			rf.state = Leader
 			rf.leaderId = rf.me
@@ -953,6 +968,7 @@ func (rf *Raft) voteSelf() (int, int) {
 
 	m.Lock()
 	defer m.Unlock()
+	maxTerm := rf.currentTerm
 	for i, reply := range replies {
 		if i == rf.me {
 			continue
@@ -960,13 +976,17 @@ func (rf *Raft) voteSelf() (int, int) {
 		if reply == nil {
 			continue
 		}
-		if reply.Term > rf.currentTerm {
-			return 0, reply.Term
+		if reply.Term > maxTerm {
+			maxTerm = reply.Term
+			continue
 		}
 		if reply.VoteGranted {
 			voteCount += 1
 		} else {
 		}
+	}
+	if maxTerm > rf.currentTerm {
+		return 0, maxTerm
 	}
 	return voteCount, 0
 }
