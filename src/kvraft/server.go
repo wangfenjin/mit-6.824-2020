@@ -61,7 +61,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	state map[string]string
-	acks  map[int64]bool
+	acks  map[int64]*result
 	index int
 
 	resultCh map[int]chan result
@@ -78,6 +78,7 @@ type KVServer struct {
 type result struct {
 	UUID  int64
 	Value string
+	OK    bool
 }
 
 var TimeoutErr = errors.New("kv: timeout error")
@@ -92,17 +93,16 @@ func (kv *KVServer) context() context.Context {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.RLock()
-	if kv.acks[args.UUID] {
+	if r, ok := kv.acks[args.UUID]; ok {
 		DPrintf(kv.context(), "acked msg uuid %v, return", args.UUID)
 		defer kv.mu.RUnlock()
-		if v, ok := kv.state[args.Key]; ok {
+		if r.OK {
 			reply.Err = OK
-			reply.Value = v
-			return
+			reply.Value = r.Value
 		} else {
 			reply.Err = ErrNoKey
-			return
 		}
+		return
 	}
 	kv.mu.RUnlock()
 
@@ -121,8 +121,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrTimeout
 		return
 	} else {
-		reply.Err = OK
-		reply.Value = value
+		if value.OK {
+			reply.Err = OK
+			reply.Value = value.Value
+		} else {
+			reply.Err = ErrNoKey
+		}
 		return
 	}
 }
@@ -130,7 +134,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.RLock()
-	if kv.acks[args.UUID] {
+	if _, ok := kv.acks[args.UUID]; ok {
 		DPrintf(kv.context(), "acked msg uuid %v, return", args.UUID)
 		kv.mu.RUnlock()
 		reply.Err = OK
@@ -162,7 +166,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	return
 }
 
-func (kv *KVServer) waitResultTimeout(index int, uuid int64) (bool, string) {
+func (kv *KVServer) waitResultTimeout(index int, uuid int64) (bool, *result) {
 	kv.mu.Lock()
 	ch := make(chan result)
 	// the chan for this index might be overwrite by other requests, so this chan may never receive any message
@@ -176,11 +180,11 @@ func (kv *KVServer) waitResultTimeout(index int, uuid int64) (bool, string) {
 
 	select {
 	case <-kv.serverKilled:
-		return true, ""
+		return true, nil
 	case r := <-ch:
-		return r.UUID != uuid, r.Value
+		return r.UUID != uuid, &r
 	case <-time.After(time.Second): // timeout value can't be too small, otherwise log will piled up
-		return true, ""
+		return true, nil
 	}
 }
 
@@ -229,7 +233,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.state = make(map[string]string)
-	kv.acks = make(map[int64]bool)
+	kv.acks = make(map[int64]*result)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -328,13 +332,12 @@ func (kv *KVServer) readApplyCh() {
 			kv.index = msg.CommandIndex
 
 			op, _ := msg.Command.(Op)
-			if kv.acks[op.UUID] {
+			if _, ok := kv.acks[op.UUID]; ok {
 				DPrintf(kv.context(), "acked msg index %d, uuid %v", msg.CommandIndex, op.UUID)
 				kv.mu.Unlock()
 				break
 			}
 			DPrintf(kv.context(), "get apply msg %v", msg.CommandIndex)
-			kv.acks[op.UUID] = true
 			// filter old message
 			switch op.Command {
 			case OpCommandAppend:
@@ -344,14 +347,18 @@ func (kv *KVServer) readApplyCh() {
 			default:
 				// do nothing
 			}
+			v, ok := kv.state[op.Key]
+			r := result{
+				UUID:  op.UUID,
+				Value: v,
+				OK:    ok,
+			}
+			kv.acks[op.UUID] = &r
 			if ch, ok := kv.resultCh[kv.index]; ok {
 				select {
 				case <-kv.serverKilled:
 					return
-				case ch <- result{
-					UUID:  op.UUID,
-					Value: kv.state[op.Key],
-				}:
+				case ch <- r:
 					DPrintf(kv.context(), "notify result ch index %v success", kv.index)
 				case <-time.After(time.Millisecond * 30):
 					DPrintf(kv.context(), "abandon result ch index %d", kv.index)
