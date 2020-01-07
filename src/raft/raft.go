@@ -53,9 +53,11 @@ type ApplyMsg struct {
 }
 
 type SnapShotCommand struct {
+	Notify bool // used to notify kvserver that SaveSnapshot had succeed, it can schedule another snapshot
+
+	// If Notify is false, this is a InstallSnapshot request, kvserver should update it's state
 	Snapshot []byte
 	Index    int
-	Notify   bool
 }
 
 type raftState int
@@ -103,12 +105,13 @@ type Raft struct {
 	nextIndex  []int // index of the next log entry
 	matchIndex []int // highest log entry known to be relicated
 
-	heartbeatTime time.Time
-	newEntriesCh  []chan bool
-	killedChan    chan bool
+	heartbeatTime time.Time   // controll leader election
+	newEntriesCh  []chan bool // notify logReplication to run
+	killedChan    chan bool   // server had been killed
 
 	// snapshot
-	snapshotIndex int
+	snapshotIndex int                  // this hightest index that had been snapshoted, log[0].Index == snapshotIndex
+	snapshotChan  chan SnapShotCommand // we should snapshot now
 }
 
 func (rf *Raft) lockContext() context.Context {
@@ -161,15 +164,16 @@ func (rf *Raft) getPersistData() []byte {
 	return w.Bytes()
 }
 
-func (rf *Raft) shouldSnapshot(index, maxsize int) bool {
-	//rf.mu.RLock()
-	//defer rf.mu.RUnlock()
-	return maxsize > 0 &&
-		rf.commitIndex >= index &&
-		rf.persister.RaftStateSize() >= maxsize
+// SaveSnapshot save snapshot data and raft sate into persister
+// called by kvserver
+func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
+	rf.snapshotChan <- SnapShotCommand{
+		Snapshot: snapshot,
+		Index:    index,
+	}
 }
 
-func (rf *Raft) SaveSnapshot(snapshot []byte, index int) bool {
+func (rf *Raft) saveSnapshot(snapshot []byte, index int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.commitIndex < index {
@@ -212,15 +216,13 @@ func (rf *Raft) installSnapshot(snapshot []byte, index int) bool {
 		rf.lastApplied = rf.snapshotIndex
 	}
 	rf.log = rf.log[logTruncate:]
-	/**
 	for i, _ := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		rf.nextIndex[i] = max(1, rf.nextIndex[i]-logTruncate)
-		rf.matchIndex[i] = max(0, rf.matchIndex[i]-logTruncate)
+		rf.nextIndex[i] = max(rf.nextIndex[i], rf.snapshotIndex+1)
+		rf.matchIndex[i] = max(rf.matchIndex[i], rf.snapshotIndex)
 	}
-	*/
 
 	state := rf.getPersistData()
 	rf.persister.SaveStateAndSnapshot(state, snapshot)
@@ -596,6 +598,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Index:   index,
 	}
 	rf.log = append(rf.log, le)
+	DPrintf(rf.context(), "Install snapshot success, start!!! index %d, snapshotIndex %d, lastApplied %d, len(log) %d", index, rf.snapshotIndex, rf.lastApplied, len(rf.log))
 	return index, term, isLeader
 }
 
@@ -645,6 +648,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.lastApplied = rf.snapshotIndex
+	rf.snapshotChan = make(chan SnapShotCommand)
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
@@ -673,6 +677,9 @@ func (rf *Raft) logReplication() {
 		go func(server int) {
 			for {
 				select {
+				case cmd := <-rf.snapshotChan:
+					rf.saveSnapshot(cmd.Snapshot, cmd.Index)
+					continue
 				case <-rf.newEntriesCh[server]:
 				case <-time.After(heartbeatInterval):
 				}
@@ -682,6 +689,7 @@ func (rf *Raft) logReplication() {
 				for !drainCh {
 					select {
 					case <-rf.newEntriesCh[server]:
+						//DPrintf(rf.context(), "drain one notify")
 					default:
 						drainCh = true
 					}
@@ -698,6 +706,13 @@ func (rf *Raft) logReplication() {
 				startIndex := rf.nextIndex[server] - rf.snapshotIndex
 				endIndex := len(rf.log)
 				nextIndex := endIndex + rf.snapshotIndex
+				if startIndex > endIndex {
+					rf.mu.RUnlock()
+					rf.mu.Lock()
+					rf.nextIndex[server] = len(rf.log) + rf.snapshotIndex
+					rf.mu.Unlock()
+					continue
+				}
 				prevEntry := rf.log[startIndex-1]
 				msg := &AppendEntriesArgs{
 					Term:         rf.currentTerm,
@@ -729,8 +744,8 @@ func (rf *Raft) logReplication() {
 						DPrintf(rf.context(), "append entry success, %d", server)
 						// log might be snapshoted, so end is invalid now...
 						// TODO: may have bad case
-						rf.nextIndex[server] = nextIndex
-						rf.matchIndex[server] = nextIndex - 1
+						rf.nextIndex[server] = max(nextIndex, rf.snapshotIndex+1)
+						rf.matchIndex[server] = rf.nextIndex[server] - 1
 						rf.leaderUpdateCommitIndex()
 						rf.applyLogs()
 					} else if rf.nextIndex[server]-rf.snapshotIndex > 2 {

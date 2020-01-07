@@ -69,8 +69,9 @@ type KVServer struct {
 	serverKilled chan bool
 
 	// snapshot
-	persister     *raft.Persister
-	snapshotIndex int
+	persister   *raft.Persister
+	snapshotCh  chan bool
+	snapshoting bool
 }
 
 var TimeoutErr = errors.New("kv: timeout error")
@@ -86,6 +87,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	kv.mu.RLock()
 	if kv.acks[args.UUID] {
+		DPrintf(kv.context(), "acked msg uuid %v, return", args.UUID)
 		defer kv.mu.RUnlock()
 		if v, ok := kv.state[args.Key]; ok {
 			reply.Err = OK
@@ -130,6 +132,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	kv.mu.RLock()
 	if kv.acks[args.UUID] {
+		DPrintf(kv.context(), "acked msg uuid %v, return", args.UUID)
 		kv.mu.RUnlock()
 		reply.Err = OK
 		return
@@ -165,8 +168,8 @@ func (kv *KVServer) waitResultTimeout(index int, uuid string) bool {
 	ch := make(chan string)
 	// the chan for this index might be overwrite by other requests, so this chan may never receive any message
 	// we close this chan for `id := <=ch` to proceed
-	if _, ok := kv.resultCh[index]; ok {
-		close(kv.resultCh[index])
+	if ch, ok := kv.resultCh[index]; ok {
+		close(ch)
 		delete(kv.resultCh, index)
 	}
 	kv.resultCh[index] = ch
@@ -175,7 +178,7 @@ func (kv *KVServer) waitResultTimeout(index int, uuid string) bool {
 	select {
 	case id := <-ch:
 		return id != uuid
-	case <-time.After(time.Second * 10):
+	case <-time.After(time.Millisecond * 300):
 		return true
 	}
 }
@@ -188,15 +191,15 @@ func (kv *KVServer) waitResultTimeout(index int, uuid string) bool {
 //
 func (kv *KVServer) Kill() {
 	// Your code here, if desired.
+	kv.rf.Kill()
+
 	kv.mu.Lock()
 	close(kv.serverKilled)
 	for _, ch := range kv.resultCh {
 		close(ch)
 	}
-	kv.mu.Unlock()
-
-	kv.rf.Kill()
 	DPrintf(kv.context(), "kill server")
+	kv.mu.Unlock()
 }
 
 //
@@ -231,6 +234,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.resultCh = make(map[int]chan string)
 	kv.serverKilled = make(chan bool)
+	kv.snapshotCh = make(chan bool)
 
 	kv.readPersist()
 
@@ -241,16 +245,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	return kv
 }
 
-func (kv *KVServer) trySnapshot() {
-	if kv.index%20 == 0 && kv.rf.ShouldSnapshot(kv.index, kv.maxraftstate) {
-		kv.mu.Lock()
-		snapshot := kv.getPersistData()
-		kv.mu.Unlock()
-		if kv.rf.SaveSnapshot(snapshot, kv.index) {
-			kv.mu.Lock()
-			kv.snapshotIndex = kv.index
-			kv.mu.Unlock()
-			DPrintf(kv.context(), "save snapshot succeed, index %d", kv.snapshotIndex)
+func (kv *KVServer) snapshot(force bool) {
+	if force || !kv.snapshoting {
+		if kv.maxraftstate > 0 && kv.persister.RaftStateSize() > kv.maxraftstate {
+			kv.snapshoting = true
+			go kv.rf.SaveSnapshot(kv.getPersistData(), kv.index)
 		}
 	}
 }
@@ -275,36 +274,39 @@ func (kv *KVServer) readPersist() {
 	if d.Decode(&state) != nil ||
 		d.Decode(&snapshotIndex) != nil {
 		// do nothing
-	} else {
+	} else if kv.index < snapshotIndex {
 		kv.state = state
-		kv.snapshotIndex = snapshotIndex
-		if kv.index < snapshotIndex {
-			kv.index = snapshotIndex
-		}
-		DPrintf(kv.context(), "read persist succeed, snapshot index %d", kv.snapshotIndex)
+		kv.index = snapshotIndex
+		DPrintf(kv.context(), "read persist succeed, snapshot index %d", kv.index)
 	}
 }
 
 func (kv *KVServer) readApplyCh() {
 	for {
 		select {
+		case <-kv.serverKilled:
+			DPrintf(kv.context(), "server killed")
+			return
 		case msg := <-kv.applyCh:
+			kv.mu.Lock()
 			if !msg.CommandValid {
 				switch v := msg.Command.(type) {
 				case raft.SnapShotCommand:
-					kv.mu.Lock()
-					if v.Index > kv.index {
+					if v.Notify {
+						// make sure we can snapshot again
+						kv.snapshoting = false
+					} else if v.Index > kv.index {
 						kv.readPersist()
 					}
-					kv.mu.Unlock()
 					break
 				default:
 					panic(fmt.Sprintf("unknow command %v", v))
 				}
+				kv.mu.Unlock()
 				break
 			}
 
-			kv.mu.Lock()
+			//kv.mu.Lock()
 			if msg.CommandIndex <= kv.index {
 				// ignore old messages
 				kv.mu.Unlock()
@@ -319,16 +321,13 @@ func (kv *KVServer) readApplyCh() {
 
 			op, _ := msg.Command.(Op)
 			if kv.acks[op.UUID] {
+				DPrintf(kv.context(), "acked msg index %d, uuid %v", msg.CommandIndex, op.UUID)
 				kv.mu.Unlock()
 				break
 			}
-			// DPrintf(kv.context(), "get apply msg %v", msg)
+			DPrintf(kv.context(), "get apply msg %v", msg.CommandIndex)
 			kv.acks[op.UUID] = true
 			// filter old message
-			if kv.index <= kv.snapshotIndex {
-				kv.mu.Unlock()
-				break
-			}
 			switch op.Command {
 			case OpCommandAppend:
 				kv.state[op.Key] += op.Value
@@ -337,24 +336,26 @@ func (kv *KVServer) readApplyCh() {
 			default:
 				// do nothing
 			}
-			if _, ok := kv.resultCh[kv.index]; ok {
+			if ch, ok := kv.resultCh[kv.index]; ok {
 				select {
 				case <-kv.serverKilled:
 					return
-				case kv.resultCh[kv.index] <- op.UUID:
-					// do nothing
-				case <-time.After(time.Millisecond * 100):
+				case ch <- op.UUID:
+					DPrintf(kv.context(), "notify result ch index %v success", kv.index)
+				case <-time.After(time.Millisecond * 30):
 					DPrintf(kv.context(), "abandon result ch index %d", kv.index)
 				}
-				close(kv.resultCh[kv.index])
+				close(ch)
 				delete(kv.resultCh, kv.index)
-				DPrintf(kv.context(), "notify result ch index %v, delete ch", kv.index)
 			}
+			kv.snapshot(false)
 			kv.mu.Unlock()
-		case <-kv.serverKilled:
-			DPrintf(kv.context(), "server killed")
-			return
+		case <-time.After(snapshotInterval):
+			kv.mu.Lock()
+			kv.snapshot(true)
+			kv.mu.Unlock()
 		}
-		kv.trySnapshot()
 	}
 }
+
+const snapshotInterval = time.Millisecond * 100
