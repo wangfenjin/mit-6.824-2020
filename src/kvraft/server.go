@@ -177,9 +177,11 @@ func (kv *KVServer) waitResultTimeout(index int, uuid string) bool {
 	kv.mu.Unlock()
 
 	select {
+	case <-kv.serverKilled:
+		return false
 	case id := <-ch:
 		return id != uuid
-	case <-time.After(time.Millisecond * 300):
+	case <-time.After(time.Second): // timeout value can't be too small, otherwise log will piled up
 		return true
 	}
 }
@@ -247,7 +249,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 }
 
 func (kv *KVServer) shouldSnapshot() bool {
-	return kv.maxraftstate > 0 && kv.index > kv.snapshotIndex && kv.persister.RaftStateSize() > kv.maxraftstate
+	return kv.maxraftstate > 0 &&
+		kv.index > kv.snapshotIndex &&
+		kv.persister.RaftStateSize() > kv.maxraftstate
 }
 
 func (kv *KVServer) snapshot(force bool) {
