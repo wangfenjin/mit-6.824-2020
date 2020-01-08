@@ -50,7 +50,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
-	CommandTerm  int
+	CommandTerm  int // for kvserver to valid the response
 }
 
 type SnapShotCommand struct {
@@ -197,8 +197,6 @@ func (rf *Raft) saveSnapshot(snapshot []byte, index int) bool {
 	case rf.applyCh <- msg:
 	case <-time.After(time.Millisecond * 50):
 		DPrintf(rf.context(), "save snapshot not notify, ignore")
-		//pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
-		//panic(fmt.Sprintf("server %d blocked on install snapshot index %d for 5s", rf.me, index))
 	}
 	return ok
 
@@ -209,7 +207,6 @@ func (rf *Raft) installSnapshot(snapshot []byte, index int) bool {
 		DPrintf(rf.context(), "index %d already snapshot", index)
 		return true
 	}
-	DPrintf(rf.context(), "start to snapshot, index %d, snapshotIndex %d, lastApplied %d, len(log) %d", index, rf.snapshotIndex, rf.lastApplied, len(rf.log))
 	originIndex := rf.snapshotIndex
 	logTruncate := index - originIndex
 	if logTruncate > len(rf.log) {
@@ -387,19 +384,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
-	/**
-	if rf.leaderId != -1 && rf.leaderId != args.LeaderId {
-		DPrintf(rf.context(), "args leaderId %d < currentLeaderId %d, return", args.LeaderId, rf.leaderId)
-		return
-	}
-	*/
-
 	if args.Term < rf.currentTerm {
 		DPrintf(rf.context(), "1: args Term %d < currentTerm %d, return", args.Term, rf.currentTerm)
 		return
 	}
 	index := args.PrevLogIndex - rf.snapshotIndex
-	//DPrintf(rf.context(), "prevLogIndex %d, snapshotIndex %d, len(log) %d, args.Entry %d", args.PrevLogIndex, rf.snapshotIndex, len(rf.log), len(args.Entries))
 	if index < 0 || index >= len(rf.log) {
 		DPrintf(rf.context(), "2: log don't meet prev log condition, index %d not in log len(log) %d, from leader %d", index, len(rf.log), args.LeaderId)
 		return
@@ -458,14 +447,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
 		if !rf.applyLogs() {
-			//DPrintf(rf.context(), "receive %d entries from leader %d, apply failed", len(args.Entries), rf.leaderId)
 			reply.Success = false
 			return
 		}
 	}
 
 	rf.persist()
-	//DPrintf(rf.context(), "receive %d entries from leader %d", len(args.Entries), rf.leaderId)
 	return
 }
 
@@ -480,19 +467,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	select {
 	case res := <-ch:
 		ok = res
-		if ok {
-			if !reply.Success {
-				if len(args.Entries) == 0 {
-					DPrintf(rf.lockContext(), "heartbeat to server %d failed", server)
-				} else {
-					DPrintf(rf.lockContext(), "append entries to server %d failed", server)
-				}
+		if ok && !reply.Success {
+			if len(args.Entries) == 0 {
+				DPrintf(rf.lockContext(), "heartbeat to server %d failed", server)
 			} else {
-				if len(args.Entries) == 0 {
-					//DPrintf(rf.lockContext(), "send heartbeat to server %d success", server)
-				} else {
-					//DPrintf(rf.lockContext(), "append entries to server %d success", server)
-				}
+				DPrintf(rf.lockContext(), "append entries to server %d failed", server)
 			}
 		}
 	case <-time.After(heartbeatInterval):
@@ -706,13 +685,11 @@ func (rf *Raft) logReplication() {
 				for !drainCh {
 					select {
 					case <-rf.newEntriesCh[server]:
-						//DPrintf(rf.context(), "drain one notify")
 					default:
 						drainCh = true
 					}
 				}
 				if rf.state == Killed {
-					DPrintf(rf.context(), "start to append entry, killed return")
 					rf.mu.RUnlock()
 					return
 				}
@@ -739,13 +716,11 @@ func (rf *Raft) logReplication() {
 					LeaderCommit: rf.commitIndex,
 				}
 				if startIndex < endIndex {
-					//DPrintf(rf.context(), "next %d, end %d, first %v", rf.nextIndex[server], end, rf.log[rf.nextIndex[server]])
-					msg.Entries = rf.log[startIndex:endIndex] //append([]*LogEntry(nil), rf.log[startIndex:]...) //TODO:max entries?
+					msg.Entries = rf.log[startIndex:endIndex] // TODO: limit max entries?
 				}
 				rf.mu.RUnlock()
 
 				var reply AppendEntriesReply
-				//DPrintf(rf.context(), "append entries to %d, msg %v", server, msg)
 				if ok := rf.sendAppendEntries(server, msg, &reply); ok {
 
 					rf.mu.Lock()
@@ -877,7 +852,6 @@ func (rf *Raft) heartbeatsNow() {
 		}
 		select {
 		case rf.newEntriesCh[i] <- true:
-			//DPrintf(rf.context(), "send to newEntriesCh %d success", i)
 		case <-time.After(time.Millisecond * 5):
 			DPrintf(rf.lockContext(), "send to newEntriesCh %d failed", i)
 		}
@@ -890,7 +864,6 @@ func (rf *Raft) leaderElection() {
 	electionBackoff := 300 // incase failed node always first propose election
 	for {
 		now := time.Now()
-		// rand.Seed(now.UnixNano())
 		electionTimeout := time.Millisecond * time.Duration(rand.Intn(200)+electionBackoff)
 		time.Sleep(electionTimeout)
 
@@ -916,6 +889,7 @@ func (rf *Raft) leaderElection() {
 
 		rf.mu.Lock()
 		if term > rf.currentTerm {
+			DPrintf(rf.context(), "get a large term %d, leader election failed, wait next round", term)
 			rf.currentTerm = term
 			rf.votedFor = -1
 			rf.state = Follower

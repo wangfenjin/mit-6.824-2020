@@ -47,8 +47,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
 	args := GetArgs{
-		Key:  key,
-		UUID: nrand(),
+		Key: key,
 	}
 	index := ck.leader
 	for {
@@ -78,10 +77,11 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	args := PutAppendArgs{
-		Op:    op,
-		Key:   key,
-		Value: value,
-		UUID:  nrand(),
+		Op:        op,
+		Key:       key,
+		Value:     value,
+		ClientId:  ck.id,
+		RequestId: nrand(),
 	}
 	index := ck.leader
 	for {
