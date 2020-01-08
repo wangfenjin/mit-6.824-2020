@@ -50,6 +50,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 type SnapShotCommand struct {
@@ -185,6 +186,7 @@ func (rf *Raft) saveSnapshot(snapshot []byte, index int) bool {
 	msg := ApplyMsg{
 		CommandValid: false,
 		CommandIndex: 0, // not used
+		CommandTerm:  rf.currentTerm,
 		Command: SnapShotCommand{
 			Notify: true,
 		},
@@ -536,6 +538,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	msg := ApplyMsg{
 		CommandValid: false,
 		CommandIndex: 0, // not used
+		CommandTerm:  rf.currentTerm,
 		Command: SnapShotCommand{
 			Snapshot: args.Data,
 			Index:    args.LastIncludedIndex,
@@ -843,6 +846,7 @@ func (rf *Raft) applyLogs() bool {
 			CommandValid: true,
 			Command:      entry.Command,
 			CommandIndex: entry.Index,
+			CommandTerm:  entry.Term,
 		}
 		if rf.lastApplied != entry.Index {
 			panic("lastApplied should == entry.Index")
