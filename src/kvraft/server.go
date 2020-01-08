@@ -152,9 +152,6 @@ func (kv *KVServer) Kill() {
 
 	kv.mu.Lock()
 	close(kv.serverKilled)
-	for key := range kv.resultCh {
-		delete(kv.resultCh, key)
-	}
 	kv.rf.Kill()
 	DPrintf(kv.context(), "kill server")
 	kv.mu.Unlock()

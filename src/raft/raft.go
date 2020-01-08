@@ -883,9 +883,16 @@ func (rf *Raft) leaderElection() {
 		rf.votedFor = rf.me
 		rf.leaderId = -1
 		majority := len(rf.peers)/2 + 1
+		entry := rf.log[len(rf.log)-1]
+		args := &RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: entry.Index,
+			LastLogTerm:  entry.Term,
+		}
 		rf.mu.Unlock()
 
-		count, term := rf.voteSelf()
+		count, term := rf.voteSelf(args)
 
 		rf.mu.Lock()
 		if term > rf.currentTerm {
@@ -913,7 +920,7 @@ func (rf *Raft) leaderElection() {
 	}
 }
 
-func (rf *Raft) voteSelf() (int, int) {
+func (rf *Raft) voteSelf(args *RequestVoteArgs) (int, int) {
 	DPrintf(rf.context(), "start to vote self")
 	replies := make([]*RequestVoteReply, len(rf.peers))
 	var m sync.Mutex
@@ -926,13 +933,7 @@ func (rf *Raft) voteSelf() (int, int) {
 		go func(server int) {
 			defer wg.Done()
 			var reply RequestVoteReply
-			entry := rf.log[len(rf.log)-1]
-			if ok := rf.sendRequestVote(server, &RequestVoteArgs{
-				Term:         rf.currentTerm,
-				CandidateId:  rf.me,
-				LastLogIndex: entry.Index,
-				LastLogTerm:  entry.Term,
-			}, &reply); ok {
+			if ok := rf.sendRequestVote(server, args, &reply); ok {
 
 				m.Lock()
 				replies[server] = &reply
@@ -946,7 +947,7 @@ func (rf *Raft) voteSelf() (int, int) {
 
 	m.Lock()
 	defer m.Unlock()
-	maxTerm := rf.currentTerm
+	maxTerm := args.Term
 	for i, reply := range replies {
 		if i == rf.me {
 			continue
