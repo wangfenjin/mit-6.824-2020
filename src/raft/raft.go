@@ -661,7 +661,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.leaderElection()
 	go rf.logReplication()
 
-	DPrintf(rf.context(), "make raft node")
+	DPrintf(rf.lockContext(), "make raft node")
 	return rf
 }
 
@@ -964,7 +964,7 @@ func (rf *Raft) voteSelf(args *RequestVoteArgs) (int, int) {
 		} else {
 		}
 	}
-	if maxTerm > rf.currentTerm {
+	if maxTerm > args.Term {
 		return 0, maxTerm
 	}
 	return voteCount, 0
