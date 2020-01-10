@@ -16,7 +16,7 @@ var Debug = "0"
 
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	if debug := os.Getenv("masterdebug"); len(debug) > 0 {
+	if debug := os.Getenv("smdebug"); len(debug) > 0 {
 		Debug = debug
 	}
 }
@@ -191,7 +191,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 func (sm *ShardMaster) context() context.Context {
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, "node", sm.me)
-	ctx = context.WithValue(ctx, "type", "server")
+	ctx = context.WithValue(ctx, "type", "sm")
 	return ctx
 }
 

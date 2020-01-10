@@ -4,12 +4,17 @@ package shardmaster
 // Shardmaster clerk.
 //
 
-import "labrpc"
-import "time"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"labrpc"
+	"math/big"
+	"sync"
+	"time"
+)
 
 type Clerk struct {
+	sync.RWMutex
+
 	servers []*labrpc.ClientEnd
 	// Your data here.
 	n      int
@@ -37,17 +42,25 @@ func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
+	ck.RLock()
 	index := ck.leader
+	ck.RUnlock()
+	var updateLeader bool
 	for {
 		// try each known server.
 		for i := 0; i < ck.n; i++ {
 			var reply QueryReply
 			ok := ck.servers[index].Call("ShardMaster.Query", args, &reply)
 			if ok && !reply.WrongLeader && reply.Err == OK {
-				ck.leader = index
+				if updateLeader {
+					ck.Lock()
+					ck.leader = index
+					ck.Unlock()
+				}
 				return reply.Config
 			} else {
 				index = (index + 1) % ck.n
+				updateLeader = true
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -61,13 +74,17 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	}
 	// Your code here.
 	args.Servers = servers
+	ck.RLock()
 	index := ck.leader
+	ck.RUnlock()
 	for {
 		for i := 0; i < ck.n; i++ {
 			var reply JoinReply
 			ok := ck.servers[index].Call("ShardMaster.Join", args, &reply)
 			if ok && reply.WrongLeader == false && reply.Err == OK {
+				ck.Lock()
 				ck.leader = index
+				ck.Unlock()
 				return
 			} else {
 				index = (index + 1) % ck.n
@@ -84,13 +101,17 @@ func (ck *Clerk) Leave(gids []int) {
 	}
 	// Your code here.
 	args.GIDs = gids
+	ck.RLock()
 	index := ck.leader
+	ck.RUnlock()
 	for {
 		for i := 0; i < ck.n; i++ {
 			var reply LeaveReply
 			ok := ck.servers[index].Call("ShardMaster.Leave", args, &reply)
 			if ok && reply.WrongLeader == false && reply.Err == OK {
+				ck.Lock()
 				ck.leader = index
+				ck.Unlock()
 				return
 			} else {
 				index = (index + 1) % ck.n
@@ -108,14 +129,18 @@ func (ck *Clerk) Move(shard int, gid int) {
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
+	ck.RLock()
 	index := ck.leader
+	ck.RUnlock()
 	for {
 		// try each known server.
 		for i := 0; i < ck.n; i++ {
 			var reply MoveReply
 			ok := ck.servers[i].Call("ShardMaster.Move", args, &reply)
 			if ok && reply.WrongLeader == false && reply.Err == OK {
+				ck.Lock()
 				ck.leader = index
+				ck.Unlock()
 				return
 			} else {
 				index = (index + 1) % ck.n
