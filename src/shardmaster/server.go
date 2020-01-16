@@ -115,7 +115,6 @@ func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
-	DPrintf(sm.context(), "raft query %v", args.Num)
 	reply.Err, _ = sm.raft(Op{
 		Command: OpCommandQuery,
 		Value:   args.Num,
@@ -132,7 +131,9 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	} else if len(sm.configs) > args.Num {
 		reply.Config = sm.configs[args.Num]
 	}
-	DPrintf(sm.context(), "get config %v", reply.Config)
+	if reply.Config.Num > 0 {
+		DPrintf(sm.context(), "get config num %v value %v", args.Num, reply.Config)
+	}
 	return
 }
 
